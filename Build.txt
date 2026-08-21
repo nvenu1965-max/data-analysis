@@ -1,0 +1,622 @@
+/* ============================================================================
+   Project   : Cricsheet → Snowflake Analytics (IPL_DWH)
+   File      : build_model.sql
+   Purpose   : Build STAGED parsing view and ANALYTICS dim/fact model + views
+               from RAW.RAW_IPL_JSON. Includes data-quality checks.
+   Audience  : Run AFTER setup.sql and AFTER raw JSONs are loaded.
+   Run as    : R_IPL_DWH_DEV (or any role with rights in IPL_DWH)
+   Notes     : Fully idempotent (CREATE OR REPLACE everywhere). Safe to re-run
+               after a fresh raw load. Designed for trial-account scale.
+   ============================================================================ */
+
+USE ROLE      R_IPL_DWH_DEV;
+USE WAREHOUSE WH_IPL_DWH;
+USE DATABASE  IPL_DWH;
+
+-- ---------------------------------------------------------------------------
+-- Pre-flight check: raw table must have data
+-- ---------------------------------------------------------------------------
+SELECT
+    COUNT(*) AS raw_rows,
+    CASE WHEN COUNT(*) = 0
+         THEN 'STOP: load JSONs into RAW_IPL_JSON before running this script.'
+         ELSE 'OK: proceeding with build.'
+    END AS status
+FROM IPL_DWH.RAW.RAW_IPL_JSON;
+
+-- ===========================================================================
+-- 1. STAGED layer  —  single view that isolates all JSON access
+-- ===========================================================================
+USE SCHEMA IPL_DWH.STAGED;
+
+CREATE OR REPLACE VIEW V_MATCH_BASE AS
+SELECT
+    SPLIT_PART(SPLIT_PART(FILE_NAME, '/', -1), '.', 1)::NUMBER AS match_id,
+    FILE_NAME,
+    LOAD_TS,
+    PAYLOAD,
+    PAYLOAD:info                                    AS info,
+    PAYLOAD:innings                                 AS innings,
+    PAYLOAD:info:match_type::STRING                 AS match_type,
+    PAYLOAD:info:season::STRING                     AS season,
+    PAYLOAD:info:event:name::STRING                 AS event_name,
+    PAYLOAD:info:event:match_number::NUMBER         AS event_match_number,
+    PAYLOAD:info:dates[0]::DATE                     AS match_date,
+    PAYLOAD:info:venue::STRING                      AS venue,
+    PAYLOAD:info:city::STRING                       AS city,
+    PAYLOAD:info:teams[0]::STRING                   AS team1,
+    PAYLOAD:info:teams[1]::STRING                   AS team2,
+    PAYLOAD:info:toss:winner::STRING                AS toss_winner,
+    PAYLOAD:info:toss:decision::STRING              AS toss_decision,
+    PAYLOAD:info:outcome:winner::STRING             AS winner,
+    PAYLOAD:info:outcome:result::STRING             AS result_type,
+    PAYLOAD:info:outcome:by:runs::NUMBER            AS win_by_runs,
+    PAYLOAD:info:outcome:by:wickets::NUMBER         AS win_by_wickets,
+    PAYLOAD:info:outcome:method::STRING             AS result_method,
+    PAYLOAD:info:player_of_match[0]::STRING         AS player_of_match,
+    PAYLOAD:info:gender::STRING                     AS gender,
+    PAYLOAD:info:overs::NUMBER                      AS overs_per_innings
+FROM IPL_DWH.RAW.RAW_IPL_JSON;
+
+-- ===========================================================================
+-- 2. ANALYTICS layer  —  dimensions
+-- ===========================================================================
+USE SCHEMA IPL_DWH.ANALYTICS;
+
+-- ---- DIM_MATCH ------------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_MATCH AS
+SELECT
+    match_id,
+    match_type,
+    season,
+    event_name,
+    event_match_number,
+    match_date,
+    venue,
+    city,
+    team1,
+    team2,
+    toss_winner,
+    toss_decision,
+    winner,
+    CASE
+        WHEN result_type = 'tie'        THEN 'Tie'
+        WHEN result_type = 'no result'  THEN 'No Result'
+        WHEN win_by_runs    IS NOT NULL THEN 'Runs'
+        WHEN win_by_wickets IS NOT NULL THEN 'Wickets'
+    END                                            AS margin_type,
+    COALESCE(win_by_runs, win_by_wickets)          AS margin_value,
+    result_method,
+    player_of_match,
+    gender,
+    overs_per_innings
+FROM IPL_DWH.STAGED.V_MATCH_BASE;
+
+-- ---- DIM_TEAM -------------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_TEAM AS
+SELECT
+    HASH(team_name)::NUMBER AS team_id,
+    team_name
+FROM (
+    SELECT DISTINCT team1 AS team_name FROM IPL_DWH.STAGED.V_MATCH_BASE
+    UNION
+    SELECT DISTINCT team2 FROM IPL_DWH.STAGED.V_MATCH_BASE
+)
+WHERE team_name IS NOT NULL;
+
+-- ---- DIM_VENUE ------------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_VENUE AS
+SELECT
+    HASH(venue, city)::NUMBER AS venue_id,
+    venue,
+    city
+FROM IPL_DWH.STAGED.V_MATCH_BASE
+WHERE venue IS NOT NULL
+GROUP BY venue, city;
+
+-- ---- DIM_PLAYER -----------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_PLAYER AS
+SELECT
+    HASH(player_name)::NUMBER AS player_id,
+    player_name
+FROM (
+    SELECT DISTINCT p.value::STRING AS player_name
+    FROM IPL_DWH.STAGED.V_MATCH_BASE m,
+         LATERAL FLATTEN(input => m.info:players)        team_players,
+         LATERAL FLATTEN(input => team_players.value)    p
+)
+WHERE player_name IS NOT NULL;
+
+-- ===========================================================================
+-- 3. ANALYTICS layer  —  facts
+-- ===========================================================================
+
+-- ---- FACT_DELIVERY  (ball-by-ball grain) ----------------------------------
+CREATE OR REPLACE TABLE FACT_DELIVERY AS
+SELECT
+    b.match_id,
+    (innings.index + 1)::NUMBER                          AS innings_no,
+    innings.value:team::STRING                           AS batting_team,
+    overs.value:over::NUMBER                             AS over_no,
+    (deliveries.index + 1)::NUMBER                       AS ball_no,
+    deliveries.value:batter::STRING                      AS batter,
+    deliveries.value:non_striker::STRING                 AS non_striker,
+    deliveries.value:bowler::STRING                      AS bowler,
+    deliveries.value:runs:batter::NUMBER                 AS runs_batter,
+    deliveries.value:runs:extras::NUMBER                 AS runs_extras,
+    deliveries.value:runs:total::NUMBER                  AS runs_total,
+    OBJECT_KEYS(deliveries.value:extras)[0]::STRING      AS extras_type,
+    deliveries.value:wickets[0]:kind::STRING             AS wicket_kind,
+    deliveries.value:wickets[0]:player_out::STRING       AS player_out,
+    deliveries.value:wickets[0]:fielders                 AS fielders_raw,
+    CASE WHEN overs.value:over::NUMBER < 6 THEN TRUE ELSE FALSE END
+                                                         AS is_powerplay,
+    CASE
+        WHEN deliveries.value:extras:wides   IS NOT NULL
+          OR deliveries.value:extras:noballs IS NOT NULL
+        THEN FALSE ELSE TRUE
+    END                                                  AS is_legal_delivery
+FROM IPL_DWH.STAGED.V_MATCH_BASE b,
+     LATERAL FLATTEN(input => b.innings)               innings,
+     LATERAL FLATTEN(input => innings.value:overs)     overs,
+     LATERAL FLATTEN(input => overs.value:deliveries)  deliveries;
+
+-- ---- FACT_INNINGS  (aggregated from deliveries so totals reconcile) -------
+CREATE OR REPLACE TABLE FACT_INNINGS AS
+SELECT
+    match_id,
+    innings_no,
+    batting_team,
+    SUM(runs_total)                                      AS total_runs,
+    COUNT_IF(wicket_kind IS NOT NULL
+             AND wicket_kind NOT IN ('retired hurt','retired not out'))
+                                                         AS total_wickets,
+    COUNT_IF(is_legal_delivery)                          AS legal_balls,
+    FLOOR(COUNT_IF(is_legal_delivery) / 6)
+        || '.'
+        || MOD(COUNT_IF(is_legal_delivery), 6)           AS overs_faced
+FROM FACT_DELIVERY
+GROUP BY match_id, innings_no, batting_team;
+
+-- ===========================================================================
+-- 4. Analytics-ready views
+-- ===========================================================================
+
+-- ---- Batter summary -------------------------------------------------------
+CREATE OR REPLACE VIEW V_BATTER_SUMMARY AS
+SELECT
+    batter,
+    COUNT(DISTINCT match_id)                                     AS matches,
+    SUM(runs_batter)                                             AS runs,
+    SUM(CASE WHEN is_legal_delivery THEN 1 ELSE 0 END)           AS balls_faced,
+    ROUND(SUM(runs_batter) * 100.0
+        / NULLIF(SUM(CASE WHEN is_legal_delivery THEN 1 ELSE 0 END), 0), 2)
+                                                                 AS strike_rate,
+    COUNT_IF(runs_batter = 4)                                    AS fours,
+    COUNT_IF(runs_batter = 6)                                    AS sixes
+FROM FACT_DELIVERY
+GROUP BY batter;
+
+-- ---- Bowler summary -------------------------------------------------------
+CREATE OR REPLACE VIEW V_BOWLER_SUMMARY AS
+SELECT
+    bowler,
+    COUNT(DISTINCT match_id)                                     AS matches,
+    COUNT_IF(is_legal_delivery)                                  AS balls_bowled,
+    SUM(runs_total - COALESCE(
+        CASE WHEN extras_type IN ('byes','legbyes') THEN runs_extras END, 0))
+                                                                 AS runs_conceded,
+    COUNT_IF(wicket_kind IN ('bowled','caught','lbw','stumped',
+                              'caught and bowled','hit wicket'))  AS wickets,
+    ROUND(SUM(runs_total - COALESCE(
+        CASE WHEN extras_type IN ('byes','legbyes') THEN runs_extras END, 0)) * 6.0
+        / NULLIF(COUNT_IF(is_legal_delivery), 0), 2)             AS economy
+FROM FACT_DELIVERY
+GROUP BY bowler;
+
+-- ---- Powerplay analysis ---------------------------------------------------
+CREATE OR REPLACE VIEW V_POWERPLAY_BY_TEAM AS
+SELECT
+    batting_team,
+    COUNT(DISTINCT match_id)                                     AS matches,
+    SUM(runs_total)                                              AS pp_runs,
+    COUNT_IF(wicket_kind IS NOT NULL)                            AS pp_wickets,
+    ROUND(SUM(runs_total) * 6.0
+        / NULLIF(COUNT_IF(is_legal_delivery), 0), 2)             AS pp_run_rate
+FROM FACT_DELIVERY
+WHERE is_powerplay
+GROUP BY batting_team;
+
+-- ---- Match scorecard helper ----------------------------------------------
+CREATE OR REPLACE VIEW V_MATCH_SCORECARD AS
+SELECT
+    m.match_id,
+    m.season,
+    m.match_date,
+    m.venue,
+    m.team1,
+    m.team2,
+    m.winner,
+    m.margin_type,
+    m.margin_value,
+    i.innings_no,
+    i.batting_team,
+    i.total_runs,
+    i.total_wickets,
+    i.overs_faced
+FROM DIM_MATCH    m
+JOIN FACT_INNINGS i ON i.match_id = m.match_id;
+
+-- ===========================================================================
+-- 5. Data quality checks
+-- ===========================================================================
+
+-- Row-count overview
+SELECT
+    (SELECT COUNT(*) FROM IPL_DWH.RAW.RAW_IPL_JSON)        AS raw_rows,
+    (SELECT COUNT(*) FROM DIM_MATCH)                        AS dim_match_rows,
+    (SELECT COUNT(*) FROM DIM_TEAM)                         AS dim_team_rows,
+    (SELECT COUNT(*) FROM DIM_VENUE)                        AS dim_venue_rows,
+    (SELECT COUNT(*) FROM DIM_PLAYER)                       AS dim_player_rows,
+    (SELECT COUNT(*) FROM FACT_INNINGS)                     AS fact_innings_rows,
+    (SELECT COUNT(*) FROM FACT_DELIVERY)                    AS fact_delivery_rows;
+
+-- Null-key checks
+SELECT 'DIM_MATCH null match_id'   AS check_name, COUNT(*) AS bad_rows
+  FROM DIM_MATCH     WHERE match_id IS NULL
+UNION ALL
+SELECT 'FACT_DELIVERY null match_id',          COUNT(*)
+  FROM FACT_DELIVERY WHERE match_id IS NULL
+UNION ALL
+SELECT 'FACT_DELIVERY null batter/bowler',     COUNT(*)
+  FROM FACT_DELIVERY WHERE batter IS NULL OR bowler IS NULL;
+
+-- Orphan deliveries (no parent in DIM_MATCH)
+SELECT COUNT(*) AS orphan_delivery_rows
+FROM FACT_DELIVERY d
+LEFT JOIN DIM_MATCH m USING (match_id)
+WHERE m.match_id IS NULL;
+
+-- Runs reconciliation: JSON vs FACT_INNINGS — should return zero rows
+WITH json_totals AS (
+    SELECT
+        SPLIT_PART(SPLIT_PART(FILE_NAME,'/',-1),'.',1)::NUMBER AS match_id,
+        (i.index + 1)                                          AS innings_no,
+        SUM(d.value:runs:total::NUMBER)                        AS json_runs
+    FROM IPL_DWH.RAW.RAW_IPL_JSON r,
+         LATERAL FLATTEN(input => r.PAYLOAD:innings)         i,
+         LATERAL FLATTEN(input => i.value:overs)             o,
+         LATERAL FLATTEN(input => o.value:deliveries)        d
+    GROUP BY 1,2
+)
+SELECT j.match_id, j.innings_no, j.json_runs, f.total_runs,
+       (j.json_runs - f.total_runs) AS diff
+FROM json_totals j
+JOIN FACT_INNINGS f USING (match_id, innings_no)
+WHERE j.json_runs <> f.total_runs
+LIMIT 20;
+
+SELECT 'Build complete.' AS status;
+
+-- ===========================================================================
+-- 6. Playoff & Final performance query (filtered to CURRENT IPL season players)
+--    Includes the player's current-season team (most recent appearance).
+--    Identifies knockout matches via PAYLOAD:info:event:stage
+--    (Final, Semi Final, Qualifier 1/2, Eliminator, 3rd Place Play-Off, etc.)
+-- ===========================================================================
+WITH current_season AS (
+    SELECT MAX(season) AS season FROM IPL_DWH.ANALYTICS.DIM_MATCH
+),
+player_team_appearances AS (
+    -- batter -> batting_team
+    SELECT d.batter AS player, d.batting_team AS team, m.match_date
+    FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id)
+    JOIN current_season c ON m.season = c.season
+    UNION ALL
+    -- bowler -> the team that is NOT batting (i.e., bowling side)
+    SELECT d.bowler AS player,
+           CASE WHEN d.batting_team = m.team1 THEN m.team2 ELSE m.team1 END AS team,
+           m.match_date
+    FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id)
+    JOIN current_season c ON m.season = c.season
+),
+current_players AS (
+    SELECT player, team AS current_team
+    FROM (
+        SELECT player, team,
+               ROW_NUMBER() OVER (PARTITION BY player ORDER BY match_date DESC) AS rn
+        FROM player_team_appearances
+    )
+    WHERE rn = 1
+),
+playoff_matches AS (
+    SELECT
+        SPLIT_PART(SPLIT_PART(FILE_NAME,'/',-1),'.',1)::NUMBER AS match_id,
+        PAYLOAD:info:event:stage::STRING                       AS stage
+    FROM IPL_DWH.RAW.RAW_IPL_JSON
+    WHERE PAYLOAD:info:event:stage IS NOT NULL
+),
+batting AS (
+    SELECT
+        d.batter                                             AS player,
+        cp.current_team,
+        p.stage,
+        COUNT(DISTINCT d.match_id)                           AS playoff_matches,
+        SUM(d.runs_batter)                                   AS runs,
+        SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END) AS balls_faced,
+        ROUND(SUM(d.runs_batter) * 100.0
+            / NULLIF(SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END),0), 2)
+                                                             AS strike_rate,
+        COUNT_IF(d.runs_batter = 4)                          AS fours,
+        COUNT_IF(d.runs_batter = 6)                          AS sixes
+    FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN playoff_matches p USING (match_id)
+    JOIN current_players cp ON d.batter = cp.player
+    GROUP BY d.batter, cp.current_team, p.stage
+),
+bowling AS (
+    SELECT
+        d.bowler                                             AS player,
+        cp.current_team,
+        p.stage,
+        COUNT(DISTINCT d.match_id)                           AS playoff_matches,
+        COUNT_IF(d.is_legal_delivery)                        AS balls_bowled,
+        SUM(d.runs_total - COALESCE(
+            CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0))
+                                                             AS runs_conceded,
+        COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                                   'caught and bowled','hit wicket'))
+                                                             AS wickets,
+        ROUND(SUM(d.runs_total - COALESCE(
+            CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0)) * 6.0
+            / NULLIF(COUNT_IF(d.is_legal_delivery), 0), 2)   AS economy
+    FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN playoff_matches p USING (match_id)
+    JOIN current_players cp ON d.bowler = cp.player
+    GROUP BY d.bowler, cp.current_team, p.stage
+)
+SELECT 'BATTING' AS role, player, current_team, stage, playoff_matches,
+       runs AS runs_or_wickets, balls_faced AS balls,
+       strike_rate AS rate, fours, sixes, NULL::NUMBER AS economy
+FROM batting
+WHERE balls_faced >= 30        -- min qualification
+UNION ALL
+SELECT 'BOWLING', player, current_team, stage, playoff_matches,
+       wickets, balls_bowled, NULL, NULL, NULL, economy
+FROM bowling
+WHERE balls_bowled >= 24       -- at least 4 overs
+ORDER BY role, stage, runs_or_wickets DESC;
+
+-- ===========================================================================
+-- 7. Powerplay specialists (batters) - current-season players
+--    Strike rate & runs in overs 1-6
+-- ===========================================================================
+WITH cs AS (SELECT MAX(season) AS season FROM IPL_DWH.ANALYTICS.DIM_MATCH),
+cur AS (
+    SELECT DISTINCT d.batter AS player FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id) JOIN cs ON m.season = cs.season
+)
+SELECT
+    d.batter                                             AS player,
+    SUM(d.runs_batter)                                   AS pp_runs,
+    SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END) AS pp_balls,
+    ROUND(SUM(d.runs_batter) * 100.0
+        / NULLIF(SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END),0), 2) AS pp_sr,
+    COUNT_IF(d.runs_batter = 4)                          AS fours,
+    COUNT_IF(d.runs_batter = 6)                          AS sixes
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+JOIN cur ON d.batter = cur.player
+WHERE d.is_powerplay = TRUE
+GROUP BY d.batter
+HAVING pp_balls >= 100
+ORDER BY pp_sr DESC, pp_runs DESC
+LIMIT 25;
+
+-- ===========================================================================
+-- 8. Death-overs bowlers (overs 16-20) - economy & wickets
+-- ===========================================================================
+SELECT
+    d.bowler                                             AS player,
+    COUNT(DISTINCT d.match_id)                           AS matches,
+    COUNT_IF(d.is_legal_delivery)                        AS balls,
+    SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0))
+                                                         AS runs_conceded,
+    ROUND(SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0)) * 6.0
+        / NULLIF(COUNT_IF(d.is_legal_delivery), 0), 2)   AS economy,
+    COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                               'caught and bowled','hit wicket')) AS wickets
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+WHERE d.over_no BETWEEN 16 AND 20
+GROUP BY d.bowler
+HAVING balls >= 120
+ORDER BY economy ASC
+LIMIT 25;
+
+-- ===========================================================================
+-- 9. Toss impact - does winning the toss help?
+-- ===========================================================================
+SELECT
+    toss_decision,
+    COUNT(*)                                             AS matches,
+    SUM(CASE WHEN toss_winner = winner THEN 1 ELSE 0 END) AS toss_winner_won,
+    ROUND(100.0 * SUM(CASE WHEN toss_winner = winner THEN 1 ELSE 0 END)
+          / NULLIF(COUNT(*),0), 2)                       AS win_pct_after_toss
+FROM IPL_DWH.ANALYTICS.DIM_MATCH
+WHERE winner IS NOT NULL AND toss_decision IS NOT NULL
+GROUP BY toss_decision
+ORDER BY matches DESC;
+
+-- ===========================================================================
+-- 10. Highest individual batter scores in a single match
+-- ===========================================================================
+SELECT
+    d.match_id,
+    m.match_date,
+    m.season,
+    d.batting_team,
+    d.batter,
+    SUM(d.runs_batter)                                   AS runs,
+    SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END) AS balls,
+    COUNT_IF(d.runs_batter = 4)                          AS fours,
+    COUNT_IF(d.runs_batter = 6)                          AS sixes,
+    ROUND(SUM(d.runs_batter) * 100.0
+        / NULLIF(SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END),0), 2) AS sr
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id)
+GROUP BY d.match_id, m.match_date, m.season, d.batting_team, d.batter
+ORDER BY runs DESC
+LIMIT 25;
+
+-- ===========================================================================
+-- 11. Best bowling figures in a single match (5+ wicket hauls etc.)
+-- ===========================================================================
+SELECT
+    d.match_id,
+    m.match_date,
+    m.season,
+    d.bowler,
+    COUNT_IF(d.is_legal_delivery)                        AS balls,
+    SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0))
+                                                         AS runs_conceded,
+    COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                               'caught and bowled','hit wicket')) AS wickets
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id)
+GROUP BY d.match_id, m.match_date, m.season, d.bowler
+HAVING wickets >= 4
+ORDER BY wickets DESC, runs_conceded ASC
+LIMIT 25;
+
+-- ===========================================================================
+-- 12. Team head-to-head record (current-season teams)
+-- ===========================================================================
+WITH cs AS (SELECT MAX(season) AS season FROM IPL_DWH.ANALYTICS.DIM_MATCH),
+cur_teams AS (
+    SELECT team1 AS team FROM IPL_DWH.ANALYTICS.DIM_MATCH m JOIN cs ON m.season = cs.season
+    UNION
+    SELECT team2 FROM IPL_DWH.ANALYTICS.DIM_MATCH m JOIN cs ON m.season = cs.season
+),
+pairs AS (
+    SELECT
+        LEAST(team1, team2)    AS team_a,
+        GREATEST(team1, team2) AS team_b,
+        winner
+    FROM IPL_DWH.ANALYTICS.DIM_MATCH
+    WHERE team1 IN (SELECT team FROM cur_teams)
+      AND team2 IN (SELECT team FROM cur_teams)
+      AND winner IS NOT NULL
+)
+SELECT
+    team_a,
+    team_b,
+    COUNT(*)                                             AS matches,
+    SUM(CASE WHEN winner = team_a THEN 1 ELSE 0 END)     AS team_a_wins,
+    SUM(CASE WHEN winner = team_b THEN 1 ELSE 0 END)     AS team_b_wins
+FROM pairs
+GROUP BY team_a, team_b
+ORDER BY matches DESC;
+
+-- ===========================================================================
+-- 13. Venue scoring trends - average 1st innings total per venue
+-- ===========================================================================
+WITH innings_totals AS (
+    SELECT match_id, innings_no, SUM(runs_total) AS innings_runs
+    FROM IPL_DWH.ANALYTICS.FACT_DELIVERY
+    GROUP BY match_id, innings_no
+)
+SELECT
+    m.venue,
+    m.city,
+    COUNT(*)                                             AS matches,
+    ROUND(AVG(CASE WHEN i.innings_no = 1 THEN i.innings_runs END), 1) AS avg_first_inns,
+    ROUND(AVG(CASE WHEN i.innings_no = 2 THEN i.innings_runs END), 1) AS avg_second_inns
+FROM innings_totals i
+JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id)
+GROUP BY m.venue, m.city
+HAVING matches >= 5
+ORDER BY avg_first_inns DESC
+LIMIT 25;
+
+-- ===========================================================================
+-- 14. Middle-overs (overs 7-15) batting stats - current-season players
+-- ===========================================================================
+WITH cs AS (SELECT MAX(season) AS season FROM IPL_DWH.ANALYTICS.DIM_MATCH),
+cur AS (
+    SELECT DISTINCT d.batter AS player FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id) JOIN cs ON m.season = cs.season
+)
+SELECT
+    d.batter                                             AS player,
+    COUNT(DISTINCT d.match_id)                           AS matches,
+    SUM(d.runs_batter)                                   AS mid_runs,
+    SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END) AS mid_balls,
+    ROUND(SUM(d.runs_batter) * 100.0
+        / NULLIF(SUM(CASE WHEN d.is_legal_delivery THEN 1 ELSE 0 END),0), 2) AS mid_sr,
+    COUNT_IF(d.runs_batter = 4)                          AS fours,
+    COUNT_IF(d.runs_batter = 6)                          AS sixes,
+    ROUND(SUM(d.runs_batter)
+        / NULLIF(COUNT_IF(d.player_out = d.batter), 0), 2) AS avg_runs_per_dismissal
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+JOIN cur ON d.batter = cur.player
+WHERE d.over_no BETWEEN 7 AND 15
+GROUP BY d.batter
+HAVING mid_balls >= 150
+ORDER BY mid_runs DESC, mid_sr DESC
+LIMIT 25;
+
+-- ===========================================================================
+-- 15. Middle-overs (overs 7-15) bowling stats - current-season players
+-- ===========================================================================
+WITH cs AS (SELECT MAX(season) AS season FROM IPL_DWH.ANALYTICS.DIM_MATCH),
+cur AS (
+    SELECT DISTINCT d.bowler AS player FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+    JOIN IPL_DWH.ANALYTICS.DIM_MATCH m USING (match_id) JOIN cs ON m.season = cs.season
+)
+SELECT
+    d.bowler                                             AS player,
+    COUNT(DISTINCT d.match_id)                           AS matches,
+    COUNT_IF(d.is_legal_delivery)                        AS balls,
+    SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0))
+                                                         AS runs_conceded,
+    COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                               'caught and bowled','hit wicket')) AS wickets,
+    ROUND(SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0)) * 6.0
+        / NULLIF(COUNT_IF(d.is_legal_delivery), 0), 2)   AS economy,
+    ROUND(COUNT_IF(d.is_legal_delivery)
+        / NULLIF(COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                          'caught and bowled','hit wicket')), 0), 2) AS strike_rate_balls_per_wkt,
+    ROUND(SUM(d.runs_total - COALESCE(
+        CASE WHEN d.extras_type IN ('byes','legbyes') THEN d.runs_extras END, 0)) * 1.0
+        / NULLIF(COUNT_IF(d.wicket_kind IN ('bowled','caught','lbw','stumped',
+                          'caught and bowled','hit wicket')), 0), 2) AS bowling_average
+FROM IPL_DWH.ANALYTICS.FACT_DELIVERY d
+JOIN cur ON d.bowler = cur.player
+WHERE d.over_no BETWEEN 7 AND 15
+GROUP BY d.bowler
+HAVING balls >= 150
+ORDER BY wickets DESC, economy ASC
+LIMIT 25;
+
+/* ============================================================================
+   SMOKE-TEST QUERIES (run ad-hoc, not as part of build):
+
+   -- Top 10 run-scorers
+   SELECT * FROM IPL_DWH.ANALYTICS.V_BATTER_SUMMARY
+   ORDER BY runs DESC LIMIT 10;
+
+   -- Most economical bowlers (min 1000 legal balls)
+   SELECT * FROM IPL_DWH.ANALYTICS.V_BOWLER_SUMMARY
+   WHERE balls_bowled >= 1000
+   ORDER BY economy ASC LIMIT 10;
+
+   -- Best powerplay teams
+   SELECT * FROM IPL_DWH.ANALYTICS.V_POWERPLAY_BY_TEAM
+   ORDER BY pp_run_rate DESC;
+   ============================================================================ */
