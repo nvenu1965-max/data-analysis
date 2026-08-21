@@ -1,0 +1,244 @@
+/* ============================================================================
+   Project   : Cricsheet → Snowflake Analytics (IPL_DWH)
+   File      : setup.sql
+   Purpose   : One-shot setup of database, schemas, warehouse, role, stages,
+               file formats, raw table, and the unzip stored procedure.
+   Audience  : Team members spinning up the project on a Snowflake trial.
+   Run as    : ACCOUNTADMIN (or a role with CREATE WAREHOUSE/DATABASE/ROLE)
+   Notes     : Script is idempotent — safe to re-run. Designed to stay within
+               trial-account limits (no external stages, no Snowpipe).
+   ============================================================================ */
+
+-- ---------------------------------------------------------------------------
+-- 0. Session context
+-- ---------------------------------------------------------------------------
+USE ROLE ACCOUNTADMIN;
+
+-- ---------------------------------------------------------------------------
+-- 1. Warehouse  (XSMALL, auto-suspend to keep credits in check)
+-- ---------------------------------------------------------------------------
+CREATE WAREHOUSE IF NOT EXISTS WH_IPL_DWH
+    WAREHOUSE_SIZE     = 'XSMALL'
+    AUTO_SUSPEND       = 60
+    AUTO_RESUME        = TRUE
+    INITIALLY_SUSPENDED= TRUE
+    COMMENT            = 'XSMALL WH for Cricsheet IPL pipeline';
+
+USE WAREHOUSE WH_IPL_DWH;
+
+-- ---------------------------------------------------------------------------
+-- 2. Database & schemas (RAW / STAGED / ANALYTICS)
+-- ---------------------------------------------------------------------------
+CREATE DATABASE IF NOT EXISTS IPL_DWH
+    COMMENT = 'Cricsheet IPL data warehouse';
+
+CREATE SCHEMA IF NOT EXISTS IPL_DWH.RAW       COMMENT = 'Raw zips, JSON stage, raw VARIANT table';
+CREATE SCHEMA IF NOT EXISTS IPL_DWH.STAGED    COMMENT = 'Parsing views over RAW';
+CREATE SCHEMA IF NOT EXISTS IPL_DWH.ANALYTICS COMMENT = 'Curated dim/fact + analytics views';
+
+-- ---------------------------------------------------------------------------
+-- 3. Project role & grants
+-- ---------------------------------------------------------------------------
+CREATE ROLE IF NOT EXISTS R_IPL_DWH_DEV
+    COMMENT = 'Developer role for the IPL_DWH project';
+
+GRANT USAGE  ON WAREHOUSE WH_IPL_DWH TO ROLE R_IPL_DWH_DEV;
+GRANT USAGE  ON DATABASE  IPL_DWH    TO ROLE R_IPL_DWH_DEV;
+GRANT USAGE  ON SCHEMA    IPL_DWH.RAW       TO ROLE R_IPL_DWH_DEV;
+GRANT USAGE  ON SCHEMA    IPL_DWH.STAGED    TO ROLE R_IPL_DWH_DEV;
+GRANT USAGE  ON SCHEMA    IPL_DWH.ANALYTICS TO ROLE R_IPL_DWH_DEV;
+
+GRANT CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT,
+      CREATE PROCEDURE, CREATE FUNCTION
+    ON SCHEMA IPL_DWH.RAW       TO ROLE R_IPL_DWH_DEV;
+GRANT CREATE TABLE, CREATE VIEW ON SCHEMA IPL_DWH.STAGED    TO ROLE R_IPL_DWH_DEV;
+GRANT CREATE TABLE, CREATE VIEW ON SCHEMA IPL_DWH.ANALYTICS TO ROLE R_IPL_DWH_DEV;
+
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+    ON FUTURE TABLES IN DATABASE IPL_DWH TO ROLE R_IPL_DWH_DEV;
+GRANT SELECT ON FUTURE VIEWS  IN DATABASE IPL_DWH TO ROLE R_IPL_DWH_DEV;
+GRANT READ, WRITE ON FUTURE STAGES IN DATABASE IPL_DWH TO ROLE R_IPL_DWH_DEV;
+
+-- Grant the role to whoever will work on the project; edit this list.
+GRANT ROLE R_IPL_DWH_DEV TO ROLE SYSADMIN;
+-- GRANT ROLE R_IPL_DWH_DEV TO USER <your_user>;
+
+-- Switch into the project role for the rest of the script
+USE ROLE R_IPL_DWH_DEV;
+USE WAREHOUSE WH_IPL_DWH;
+USE DATABASE  IPL_DWH;
+USE SCHEMA    RAW;
+
+-- ---------------------------------------------------------------------------
+-- 4. Resource monitor (optional but recommended on trial)
+-- ---------------------------------------------------------------------------
+USE ROLE ACCOUNTADMIN;
+
+CREATE RESOURCE MONITOR IF NOT EXISTS RM_IPL_DWH
+    WITH CREDIT_QUOTA       = 100
+         FREQUENCY          = MONTHLY
+         START_TIMESTAMP    = IMMEDIATELY
+         TRIGGERS
+            ON 75 PERCENT DO NOTIFY
+            ON 90 PERCENT DO NOTIFY
+            ON 100 PERCENT DO SUSPEND
+            ON 110 PERCENT DO SUSPEND_IMMEDIATE;
+
+ALTER WAREHOUSE WH_IPL_DWH SET RESOURCE_MONITOR = RM_IPL_DWH;
+
+USE ROLE R_IPL_DWH_DEV;
+
+-- ---------------------------------------------------------------------------
+-- 5. File formats
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FILE FORMAT IPL_DWH.RAW.FF_JSON
+    TYPE              = JSON
+    STRIP_OUTER_ARRAY = FALSE      -- each Cricsheet file is one match object
+    COMPRESSION       = AUTO       -- handles .json and .json.gz
+    ALLOW_DUPLICATE   = FALSE
+    IGNORE_UTF8_ERRORS= FALSE
+    COMMENT           = 'Cricsheet per-match JSON';
+
+-- ---------------------------------------------------------------------------
+-- 6. Internal stages
+--    STG_IPL_ZIP  : team uploads the Cricsheet ZIP here
+--    STG_IPL_JSON : SP unzips files here for COPY INTO
+-- ---------------------------------------------------------------------------
+
+--drop stage IPL_DWH.RAW.STG_IPL_ZIP
+CREATE STAGE IF NOT EXISTS IPL_DWH.RAW.STG_IPL_ZIP
+    DIRECTORY = (ENABLE = TRUE)
+    COMMENT   = 'Cricsheet ZIP files uploaded via SnowSQL PUT';
+--drop stage IPL_DWH.RAW.STG_IPL_JSON
+CREATE STAGE IF NOT EXISTS IPL_DWH.RAW.STG_IPL_JSON
+    DIRECTORY  = (ENABLE = TRUE)
+    FILE_FORMAT= IPL_DWH.RAW.FF_JSON
+    COMMENT    = 'Unzipped per-match JSON files';
+
+-- ---------------------------------------------------------------------------
+-- 7. Raw landing table
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS IPL_DWH.RAW.RAW_IPL_JSON (
+    FILE_NAME   VARCHAR,
+    LOAD_TS     TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+    PAYLOAD     VARIANT
+)
+COMMENT = 'One row per Cricsheet match JSON; PAYLOAD holds the full document';
+
+-- ---------------------------------------------------------------------------
+-- 8. Unzip stored procedure  (ZIP on stage → individual JSONs on stage)
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE IPL_DWH.RAW.SP_UNZIP_CRICSHEET("ZIP_FILE_NAME" VARCHAR)
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS OWNER
+AS
+$$
+import io
+import os
+import zipfile
+
+SRC_STAGE  = "@IPL_DWH.RAW.STG_IPL_ZIP"
+DEST_STAGE = "@IPL_DWH.RAW.STG_IPL_JSON"
+
+def main(session, zip_file_name: str) -> str:
+    src_path = f"{SRC_STAGE}/{zip_file_name}"
+
+    with session.file.get_stream(src_path) as fh:
+        zip_bytes = fh.read()
+    buf = io.BytesIO(zip_bytes)
+
+    uploaded = skipped = failed = 0
+    errors = []
+
+    with zipfile.ZipFile(buf) as zf:
+        for member in zf.infolist():
+            name = member.filename
+            if (member.is_dir()
+                or not name.lower().endswith(".json")
+                or name.startswith("__MACOSX/")
+                or os.path.basename(name).startswith(".")):
+                skipped += 1
+                continue
+            try:
+                with zf.open(member, "r") as src:
+                    data = src.read()
+                flat_name = os.path.basename(name)
+                file_obj  = io.BytesIO(data)
+                file_obj.seek(0)
+                session.file.put_stream(
+                    file_obj,
+                    f"{DEST_STAGE}/{flat_name}",
+                    auto_compress = True,
+                    overwrite     = True,
+                )
+                uploaded += 1
+            except Exception as e:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"{name}: {type(e).__name__}: {e}")
+
+    msg = (f"Source: {src_path} | Uploaded: {uploaded} | "
+           f"Skipped: {skipped} | Failed: {failed} -> {DEST_STAGE}")
+    if errors:
+        msg += " | Sample errors: " + " || ".join(errors)
+    return msg
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 9. Verification
+-- ---------------------------------------------------------------------------
+SHOW WAREHOUSES   LIKE 'WH_IPL_DWH';
+SHOW DATABASES    LIKE 'IPL_DWH';
+SHOW SCHEMAS      IN DATABASE IPL_DWH;
+SHOW STAGES       IN SCHEMA IPL_DWH.RAW;
+SHOW FILE FORMATS IN SCHEMA IPL_DWH.RAW;
+SHOW TABLES       IN SCHEMA IPL_DWH.RAW;
+SHOW PROCEDURES   IN SCHEMA IPL_DWH.RAW;
+
+SELECT 'Setup complete.' AS status;
+
+-- /* ============================================================================
+
+step0 : https://app.snowflake.com/ytsqitp/px31897/#/homepage
+userid : nvenu
+password: Gowtham@25062006
+--    NEXT STEPS  (run from your local SnowSQL session, not this script):
+
+--    1. Download the Cricsheet IPL ZIP from https://cricsheet.org/downloads/
+--       e.g.  ipl_json.zip
+
+--    2. Upload to the ZIP stage:
+--         snowsql -a <account> -u <user> -r R_IPL_DWH_DEV -w WH_IPL_DWH \
+--                 -d IPL_DWH -s RAW
+--         PUT file:///path/to/ipl_json.zip @STG_IPL_ZIP
+--             AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+
+--    3. Unzip on the stage:
+--         CALL IPL_DWH.RAW.SP_UNZIP_CRICSHEET('ipl_json.zip');
+
+--    4. Load into RAW_IPL_JSON:
+       
+
+
+  COPY INTO IPL_DWH.RAW.RAW_IPL_JSON (FILE_NAME, PAYLOAD)
+FROM (
+  SELECT
+    METADATA$FILENAME        AS file_name,
+    $1                       AS payload
+  FROM @IPL_DWH.RAW.STG_IPL_JSON
+  (FILE_FORMAT => 'IPL_DWH.RAW.FF_JSON')
+)
+PATTERN = '.*\\.json(\\.gz)?$'
+ON_ERROR = CONTINUE
+PURGE = FALSE;
+
+--    5. Run build_model.sql to create STAGED views and ANALYTICS dim/fact tables.
+--    ============================================================================ */
+
+--truncate table   IPL_DWH.RAW.RAW_IPL_JSON 
+
+--select * from IPL_DWH.RAW.RAW_IPL_JSON 
